@@ -5,7 +5,8 @@
 ### المشروع الرئيسي
 - **المسار:** `C:\Users\gqwxg\OneDrive\Desktop\0\iwantdz`
 - **الوصف:** مشروع Flutter (Frontend) + Backend
-- **Backend:** `C:\Users\gqwxg\OneDrive\Desktop\0\iwantdz\backend`
+- **Backend:** ملفات backend موجودة في المسار الجذري (لتطابق Codespace)
+- **مجلد backend:** يحتوي على نسخة احتياطية من ملفات backend
 
 ### المشاريع المحذوفة
 - ~~`C:\Users\gqwxg\OneDrive\Desktop\iwantdz`~~ (تم الاستغناء عنه)
@@ -58,3 +59,5 @@ git remote -v
 - **آخر تحديث:** إصلاح تسجيل المستخدم وإضافة عمود password
 - **تاريخ الرفع الأول:** 21 أغسطس 2026
 - **ملاحظات:** تم إزالة ملفات hprof الكبيرة و ky.json من git history قبل الرفع
+- **تاريخ إصلاح هيكل المشروع:** 21 أغسطس 2026
+- **ملاحظات إضافية:** تم نقل ملفات backend إلى المسار الجذري لتطابق هيكل Codespace
