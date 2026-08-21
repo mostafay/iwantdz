@@ -3,21 +3,6 @@ const fs = require('fs');
 const { google } = require('googleapis');
 require('dotenv').config();
 
-// Google Sheets service account credentials from environment variables
-const serviceAccountCredentials = {
-  type: process.env.GOOGLE_TYPE || 'service_account',
-  project_id: process.env.GOOGLE_PROJECT_ID,
-  private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
-  private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  client_email: process.env.GOOGLE_CLIENT_EMAIL,
-  client_id: process.env.GOOGLE_CLIENT_ID,
-  auth_uri: process.env.GOOGLE_AUTH_URI || 'https://accounts.google.com/o/oauth2/auth',
-  token_uri: process.env.GOOGLE_TOKEN_URI || 'https://oauth2.googleapis.com/token',
-  auth_provider_x509_cert_url: process.env.GOOGLE_AUTH_PROVIDER_CERT_URL || 'https://www.googleapis.com/oauth2/v1/certs',
-  client_x509_cert_url: process.env.GOOGLE_CLIENT_CERT_URL,
-  universe_domain: process.env.GOOGLE_UNIVERSE_DOMAIN || 'googleapis.com'
-};
-
 // Database configuration
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
@@ -133,14 +118,20 @@ async function exportToGoogleSheets() {
     // First export database to JSON to get fresh data
     // console.log('Exporting database to JSON files first...');
     await exportDatabaseToJson();
-    
+
     // Export iwantdz_db.text
     const jsonData = fs.readFileSync('iwantdz_db.text', 'utf8');
     const databaseData = JSON.parse(jsonData);
-    
+
+    // Print last row of User table from database before export
+    if (databaseData.User && databaseData.User.length > 0) {
+      const lastUserRow = databaseData.User[databaseData.User.length - 1];
+      console.log('📊 Last User row from database BEFORE export:', JSON.stringify(lastUserRow));
+    }
+
     // Google Sheets authentication
     const auth = new google.auth.GoogleAuth({
-      credentials: serviceAccountCredentials,
+      keyFile: 'ky.json',
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
     
@@ -150,63 +141,16 @@ async function exportToGoogleSheets() {
     // Get existing sheets
     const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
     const existingSheets = spreadsheet.data.sheets;
-    
-    // Delete all existing sheets except the first one
-    for (let i = 1; i < existingSheets.length; i++) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [
-            {
-              deleteSheet: {
-                sheetId: existingSheets[i].properties.sheetId
-              }
-            }
-          ]
-        }
-      });
-    }
-    
-    // Clear the first sheet using its actual name
-    const firstSheetName = existingSheets[0].properties.title;
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId,
-      range: `${firstSheetName}!A1:Z10000`
-    });
-    
-    // Rename the first sheet to the first table name
+
+    console.log(`📋 Found ${existingSheets.length} existing sheets in iwantdz_db spreadsheet`);
+
+    // Get table names once
     const tableNames = Object.keys(databaseData);
-    if (tableNames.length > 0) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [
-            {
-              updateSheetProperties: {
-                properties: {
-                  sheetId: 0,
-                  title: tableNames[0]
-                },
-                fields: 'title'
-              }
-            }
-          ]
-        }
-      });
-    }
-    
-    // Add data for each table
-    for (let i = 0; i < tableNames.length; i++) {
-      const tableName = tableNames[i];
-      const tableData = databaseData[tableName];
-      
-      if (tableData.length === 0) continue;
-      
-      // Get column names from the first row
-      const columns = Object.keys(tableData[0]);
-      
-      // Create sheet if it doesn't exist (for tables after the first one)
-      if (i > 0) {
+
+    // Handle empty spreadsheet (no sheets)
+    if (existingSheets.length === 0) {
+      console.log('⚠️  Spreadsheet is empty, creating first sheet');
+      if (tableNames.length > 0) {
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
           requestBody: {
@@ -214,7 +158,7 @@ async function exportToGoogleSheets() {
               {
                 addSheet: {
                   properties: {
-                    title: tableName
+                    title: tableNames[0]
                   }
                 }
               }
@@ -222,16 +166,106 @@ async function exportToGoogleSheets() {
           }
         });
       }
-      
+    } else {
+      // Delete all existing sheets except the first one
+      for (let i = 1; i < existingSheets.length; i++) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                deleteSheet: {
+                  sheetId: existingSheets[i].properties.sheetId
+                }
+              }
+            ]
+          }
+        });
+      }
+
+      // Clear the first sheet using its actual name
+      const firstSheetName = existingSheets[0].properties.title;
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId,
+        range: `${firstSheetName}!A1:Z10000`
+      });
+
+      // Rename the first sheet to the first table name
+      if (tableNames.length > 0) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                updateSheetProperties: {
+                  properties: {
+                    sheetId: existingSheets[0].properties.sheetId,
+                    title: tableNames[0]
+                  },
+                  fields: 'title'
+                }
+              }
+            ]
+          }
+        });
+      }
+    }
+    
+    // Add data for each table
+    for (let i = 0; i < tableNames.length; i++) {
+      const tableName = tableNames[i];
+      const tableData = databaseData[tableName];
+
+      if (tableData.length === 0) continue;
+
+      // Get column names from the first row
+      const columns = Object.keys(tableData[0]);
+
+      // Create sheet if it doesn't exist (for tables after the first one)
+      if (i > 0) {
+        // Check if sheet already exists
+        const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
+        const existingSheets = spreadsheet.data.sheets;
+        const sheetExists = existingSheets.some(sheet =>
+          sheet.properties.title.toLowerCase() === tableName.toLowerCase()
+        );
+
+        if (!sheetExists) {
+          await sheets.spreadsheets.batchUpdate({
+            spreadsheetId,
+            requestBody: {
+              requests: [
+                {
+                  addSheet: {
+                    properties: {
+                      title: tableName
+                    }
+                  }
+                }
+              ]
+            }
+          });
+        } else {
+          // Clear existing sheet instead of creating new one
+          console.log(`🗑️  Clearing existing sheet: ${tableName}`);
+          await sheets.spreadsheets.values.clear({
+            spreadsheetId,
+            range: `${tableName}!A1:Z10000`
+          });
+        }
+      }
+
       // Prepare data for the sheet (headers + rows)
       const sheetData = [columns];
       tableData.forEach(row => {
         const rowData = columns.map(col => row[col] !== null && row[col] !== undefined ? String(row[col]) : '');
         sheetData.push(rowData);
       });
-      
+
+      console.log(`📝 Writing ${sheetData.length} rows to sheet: ${tableName}`);
+
       // Write data to the sheet
-      await sheets.spreadsheets.values.update({
+      const updateResult = await sheets.spreadsheets.values.update({
         spreadsheetId,
         range: `${tableName}!A1`,
         valueInputOption: 'RAW',
@@ -239,8 +273,21 @@ async function exportToGoogleSheets() {
           values: sheetData
         }
       });
-      
-      // console.log(`Exported table ${tableName} to Google Sheets`);
+
+      console.log(`✅ Exported table ${tableName} to Google Sheets (updated rows: ${updateResult.data.updatedRows})`);
+
+      // Print last row from Google Sheets after export if it's the User table
+      if (tableName === 'User') {
+        const result = await sheets.spreadsheets.values.get({
+          spreadsheetId,
+          range: 'User!A1:Z10000'
+        });
+        const rows = result.data.values;
+        if (rows && rows.length > 1) {
+          const lastRow = rows[rows.length - 1];
+          console.log('📊 Last User row from Google Sheets AFTER export:', JSON.stringify(lastRow));
+        }
+      }
     }
     
     // Now export iwantdz_user_tables.text
@@ -250,55 +297,82 @@ async function exportToGoogleSheets() {
     const userTablesData = JSON.parse(userTablesJson);
     
     const userTablesSpreadsheetId = '1eSzuBpEVG3L-qZOAKskt5y8p94h2Oy_7v_62YwD5oPE';
-    
+
+    console.log(`🔗 Exporting to iwantdz_user_tables spreadsheet: ${userTablesSpreadsheetId}`);
+
     // Get existing sheets in user tables spreadsheet
     const userSpreadsheet = await sheets.spreadsheets.get({ spreadsheetId: userTablesSpreadsheetId });
     const userExistingSheets = userSpreadsheet.data.sheets;
-    
-    // Delete all existing sheets except the first one
-    for (let i = 1; i < userExistingSheets.length; i++) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: userTablesSpreadsheetId,
-        requestBody: {
-          requests: [
-            {
-              deleteSheet: {
-                sheetId: userExistingSheets[i].properties.sheetId
-              }
-            }
-          ]
-        }
-      });
-    }
-    
-    // Clear the first sheet using its actual name
-    const userFirstSheetName = userExistingSheets[0].properties.title;
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: userTablesSpreadsheetId,
-      range: `${userFirstSheetName}!A1:Z10000`
-    });
-    
-    // Rename the first sheet to the first table name
+
+    console.log(`📋 Found ${userExistingSheets.length} existing sheets in iwantdz_user_tables spreadsheet`);
+
+    // Get table names once
     const userTableNames = Object.keys(userTablesData);
-    if (userTableNames.length > 0) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: userTablesSpreadsheetId,
-        requestBody: {
-          requests: [
-            {
-              updateSheetProperties: {
-                properties: {
-                  sheetId: 0,
-                  title: userTableNames[0]
-                },
-                fields: 'title'
+
+    // Handle empty spreadsheet (no sheets)
+    if (userExistingSheets.length === 0) {
+      console.log('⚠️  User tables spreadsheet is empty, creating first sheet');
+      if (userTableNames.length > 0) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: userTablesSpreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                addSheet: {
+                  properties: {
+                    title: userTableNames[0]
+                  }
+                }
               }
-            }
-          ]
-        }
+            ]
+          }
+        });
+      }
+    } else {
+      // Delete all existing sheets except the first one
+      for (let i = 1; i < userExistingSheets.length; i++) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: userTablesSpreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                deleteSheet: {
+                  sheetId: userExistingSheets[i].properties.sheetId
+                }
+              }
+            ]
+          }
+        });
+      }
+
+      // Clear the first sheet using its actual name
+      const userFirstSheetName = userExistingSheets[0].properties.title;
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: userTablesSpreadsheetId,
+        range: `${userFirstSheetName}!A1:Z10000`
       });
+
+      // Rename the first sheet to the first table name
+      if (userTableNames.length > 0) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: userTablesSpreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                updateSheetProperties: {
+                  properties: {
+                    sheetId: userExistingSheets[0].properties.sheetId,
+                    title: userTableNames[0]
+                  },
+                  fields: 'title'
+                }
+              }
+            ]
+          }
+        });
+      }
     }
-    
+
     // Add data for each user table
     for (let i = 0; i < userTableNames.length; i++) {
       const tableName = userTableNames[i];
@@ -375,7 +449,7 @@ async function importFromGoogleSheets() {
   try {
     // Google Sheets authentication
     const auth = new google.auth.GoogleAuth({
-      credentials: serviceAccountCredentials,
+      keyFile: 'ky.json',
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
     
@@ -565,6 +639,12 @@ async function importJsonToMySQL() {
     for (const tableName of Object.keys(mainDbData)) {
       const tableData = mainDbData[tableName];
       
+      // Skip lowercase 'user' table - only use 'User' table
+      if (tableName === 'user') {
+        console.log(`⏭️  Skipping table '${tableName}' - using 'User' table instead`);
+        continue;
+      }
+      
       if (tableData.length === 0) continue;
       
       // Get column names from first row
@@ -587,6 +667,8 @@ async function importJsonToMySQL() {
             return `\`${col}\` INT AUTO_INCREMENT PRIMARY KEY`;
           } else if (col === 'OrderIndex' || col === 'OrderPosision') {
             return `\`${col}\` TEXT`;
+          } else if (col === 'password') {
+            return `\`${col}\` VARCHAR(255)`;
           } else if (col === 'dateTime' || col === 'date' || col === 'Lastupdate') {
             return `\`${col}\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
           } else if (col === 'OrderExpired' || col === 'notificationStart' || col === 'notificationEnd' || col === 'createdAt' || col === 'lastSeen' || col === 'connectionTime') {
@@ -606,6 +688,8 @@ async function importJsonToMySQL() {
             return `\`${col}\` INT AUTO_INCREMENT PRIMARY KEY`;
           } else if (col === 'OrderIndex' || col === 'OrderPosision') {
             return `\`${col}\` TEXT`;
+          } else if (col === 'password') {
+            return `\`${col}\` VARCHAR(255)`;
           } else if (col === 'dateTime' || col === 'date' || col === 'Lastupdate') {
             return `\`${col}\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
           } else if (col === 'OrderExpired' || col === 'notificationStart' || col === 'notificationEnd' || col === 'createdAt' || col === 'lastSeen' || col === 'connectionTime') {
@@ -681,6 +765,8 @@ async function importJsonToMySQL() {
             return `\`${col}\` INT AUTO_INCREMENT PRIMARY KEY`;
           } else if (col === 'OrderIndex' || col === 'OrderPosision') {
             return `\`${col}\` TEXT`;
+          } else if (col === 'password') {
+            return `\`${col}\` VARCHAR(255)`;
           } else if (col === 'dateTime' || col === 'date' || col === 'Lastupdate') {
             return `\`${col}\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
           } else if (col === 'OrderExpired' || col === 'notificationStart' || col === 'notificationEnd' || col === 'createdAt' || col === 'lastSeen' || col === 'connectionTime') {
@@ -700,6 +786,8 @@ async function importJsonToMySQL() {
             return `\`${col}\` INT AUTO_INCREMENT PRIMARY KEY`;
           } else if (col === 'OrderIndex' || col === 'OrderPosision') {
             return `\`${col}\` TEXT`;
+          } else if (col === 'password') {
+            return `\`${col}\` VARCHAR(255)`;
           } else if (col === 'dateTime' || col === 'date' || col === 'Lastupdate') {
             return `\`${col}\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
           } else if (col === 'OrderExpired' || col === 'notificationStart' || col === 'notificationEnd' || col === 'createdAt' || col === 'lastSeen' || col === 'connectionTime') {

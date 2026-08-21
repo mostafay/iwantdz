@@ -1,86 +1,256 @@
 const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2');
+const { exec } = require('child_process');
+const { spawn } = require('child_process');
 require('dotenv').config();
 const { exportDatabaseToJson, exportToGoogleSheets, importFromGoogleSheets, importJsonToMySQL } = require('./GExel');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Check and configure MySQL on startup
+const checkAndConfigureMySQL = async () => {
+  console.log('🔍 Checking MySQL status...');
 
-// Log all incoming requests
-app.use((req, res, next) => {
-  console.log(`📡 ${req.method} ${req.url} - ${new Date().toISOString()}`);
-  console.log(`📡 Headers:`, JSON.stringify(req.headers, null, 2));
-  console.log(`📡 Body:`, JSON.stringify(req.body, null, 2));
-  next();
-});
+  // Skip auto-installation on Windows
+  if (process.platform === 'win32') {
+    console.log('ℹ️  Windows detected - skipping MySQL auto-installation');
+    console.log('ℹ️  Please ensure MySQL is installed and running');
+    return;
+  }
 
-// MySQL Database Connection for main database
+  // Try different methods to check/start MySQL
+  const whichResult = await execPromise('which mysql');
+  if (whichResult.error) {
+    console.log('⚠️  MySQL is not installed on this system');
+    console.log('📦 Attempting to install MySQL automatically...');
+    console.log('⏳ This may take a few minutes, please wait...');
+    
+    // Install MySQL automatically using spawn for better progress tracking
+    try {
+      await spawnPromise('sudo', ['apt-get', 'update']);
+      console.log('✅ Package list updated');
+      
+      await spawnPromise('sudo', ['apt-get', 'install', '-y', 'mysql-server']);
+      console.log('✅ MySQL installed successfully');
+      
+      // Start MySQL after installation
+      await startMySQL();
+    } catch (installError) {
+      console.error('❌ Failed to install MySQL automatically:', installError);
+      console.log('ℹ️  Server will continue running without MySQL');
+      console.log('ℹ️  You can install MySQL manually or use Docker');
+    }
+  } else {
+    // MySQL is installed, try to check status
+    await startMySQL();
+  }
+};
+
+// Helper function to execute commands with promises
+const execPromise = (command) => {
+  return new Promise((resolve) => {
+    exec(command, (error, stdout, stderr) => {
+      resolve({ error, stdout, stderr });
+    });
+  });
+};
+
+// Helper function to spawn commands with promises and timeout
+const spawnPromise = (command, args, timeoutMs = 30000) => {
+  return new Promise((resolve, reject) => {
+    const process = spawn(command, args);
+    let output = '';
+    
+    process.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    process.stderr.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    // Add timeout
+    const timeout = setTimeout(() => {
+      process.kill();
+      reject(new Error(`Command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    
+    process.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code === 0) {
+        resolve(output);
+      } else {
+        reject(new Error(`Command failed with code ${code}: ${output}`));
+      }
+    });
+  });
+};
+
+const startMySQL = async () => {
+  const statusResult = await execPromise('sudo service mysql status');
+  if (statusResult.error) {
+    console.log('⚠️  MySQL is not running. Attempting to start...');
+    
+    // Try service command first
+    const startResult = await execPromise('sudo service mysql start');
+    if (startResult.error) {
+      // If service command fails, try mysqld_safe
+      console.log('⚠️  service command failed, trying mysqld_safe...');
+      const safeResult = await execPromise('mysqld_safe --user=mysql &');
+      if (safeResult.error) {
+        console.log('⚠️  Could not start MySQL automatically');
+        console.log('ℹ️  Server will continue running without MySQL');
+        console.log('ℹ️  Please start MySQL manually if needed');
+        return;
+      }
+      console.log('✅ MySQL started via mysqld_safe');
+      await configureMySQL();
+    } else {
+      console.log('✅ MySQL started successfully via service');
+      await configureMySQL();
+    }
+  } else {
+    console.log('✅ MySQL is already running');
+    await configureMySQL();
+  }
+};
+
+const configureMySQL = async () => {
+  // Wait a bit for MySQL to be fully ready
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  
+  // Configure MySQL root password
+  console.log('🔧 Configuring MySQL root password...');
+  const configResult = await execPromise('sudo mysql -e "ALTER USER \'root\'@\'localhost\' IDENTIFIED WITH mysql_native_password BY \'root\'; FLUSH PRIVILEGES;"');
+  if (configResult.error) {
+    console.log('⚠️  Could not configure MySQL password (may already be configured)');
+  } else {
+    console.log('✅ MySQL password configured successfully');
+  }
+
+  // Skip start.sh script since it would cause an infinite loop
+  // start.sh contains 'node server.js' which would restart the server
+  console.log('⏭️  Skipping start.sh to avoid infinite loop');
+
+  // Import from Google Sheets after MySQL is configured
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  console.log('📥 Importing data from Google Sheets...');
+  try {
+    await importFromGoogleSheets();
+    console.log('✅ Import from Google Sheets completed');
+  } catch (importError) {
+    console.log('⚠️  Import from Google Sheets failed:', importError.message);
+  }
+};
+
+// Run MySQL check on startup, then start server
+(async () => {
+  // Skip automatic MySQL installation in Codespaces - use Docker instead
+  // await checkAndConfigureMySQL();
+  
+  // Wait for MySQL to start up (important for Docker MySQL)
+  console.log('⏳ Waiting for MySQL to start up...');
+  await new Promise(resolve => setTimeout(resolve, 20000)); // 20 second delay
+  console.log('✅ MySQL startup delay completed');
+  
+  // Middleware
+  app.use(cors());
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
+
+  // Log all incoming requests (simplified), skip update-connection-status to reduce noise
+  app.use((req, res, next) => {
+    if (req.url !== '/api/update-connection-status') {
+      console.log(`📡 ${req.method} ${req.url}`);
+    }
+    next();
+  });
+
+  // MySQL Database Connection for main database
 let db = null;
 
 // Try to connect to main database, but continue if it fails
 const initializeMainDb = () => {
   return new Promise((resolve) => {
-    // First try to connect without database to create it if needed
-    const tempDb = mysql.createConnection({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'root',
-      password: process.env.DB_PASSWORD || '',
-      port: process.env.DB_PORT || 3306
-    });
-    
-    tempDb.connect((err) => {
-      if (err) {
-        console.warn('⚠️  Main database server connection failed:', err.message);
-        console.warn('⚠️  Server will continue running without main database connection');
-        console.warn('⚠️  You can restore the database from cloud backup when ready');
-        resolve();
-        return;
-      }
+    // Function to attempt connection with retry
+    const attemptConnection = (retryCount = 0) => {
+      const maxRetries = 5;
+      const retryDelay = 3000; // 3 seconds
       
-      const createDbSql = 'CREATE DATABASE IF NOT EXISTS iwantdz_db';
+      // First try to connect without database to create it if needed
+      const tempDb = mysql.createConnection({
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASSWORD || '',
+        port: process.env.DB_PORT || 3306
+      });
       
-      tempDb.query(createDbSql, (err) => {
+      tempDb.connect((err) => {
         if (err) {
-          console.warn('⚠️  Error creating main database:', err.message);
+          if (retryCount < maxRetries) {
+            console.warn(`⚠️  Main database connection attempt ${retryCount + 1} failed, retrying in ${retryDelay/1000}s...`);
+            tempDb.end();
+            setTimeout(() => attemptConnection(retryCount + 1), retryDelay);
+            return;
+          }
+          console.warn('⚠️  Main database server connection failed:', err.message);
           console.warn('⚠️  Server will continue running without main database connection');
           console.warn('⚠️  You can restore the database from cloud backup when ready');
-          tempDb.end();
           resolve();
           return;
         }
         
-        console.log('Main database checked/created');
-        tempDb.end();
+        const createDbSql = 'CREATE DATABASE IF NOT EXISTS iwantdz_db';
         
-        // Now connect to the specific database
-        db = mysql.createConnection({
-          host: process.env.DB_HOST || 'localhost',
-          user: process.env.DB_USER || 'root',
-          password: process.env.DB_PASSWORD || '',
-          database: process.env.DB_NAME || 'iwantdz_db',
-          port: process.env.DB_PORT || 3306
-        });
-        
-        db.connect((err) => {
+        tempDb.query(createDbSql, (err) => {
           if (err) {
-            console.warn('⚠️  Main database connection failed:', err.message);
+            console.warn('⚠️  Error creating main database:', err.message);
             console.warn('⚠️  Server will continue running without main database connection');
             console.warn('⚠️  You can restore the database from cloud backup when ready');
+            tempDb.end();
             resolve();
             return;
           }
+        
+          console.log('Main database checked/created');
+          tempDb.end();
+        
+          // Now connect to the specific database
+          db = mysql.createConnection({
+            host: process.env.DB_HOST || 'localhost',
+            user: process.env.DB_USER || 'root',
+            password: process.env.DB_PASSWORD || '',
+            database: process.env.DB_NAME || 'iwantdz_db',
+            port: process.env.DB_PORT || 3306
+          });
+        
+          db.connect((err) => {
+            if (err) {
+              console.warn('⚠️  Main database connection failed:', err.message);
+              console.warn('⚠️  Server will continue running without main database connection');
+              console.warn('⚠️  You can restore the database from cloud backup when ready');
+              resolve();
+              return;
+            }
           
-          console.log('Connected to main MySQL database');
-          resolve();
+            console.log('Connected to main MySQL database');
+          
+            // Ensure SineWithId table exists
+            ensureSineWithIdTableExists((err) => {
+              if (err) {
+                console.warn('⚠️  Failed to create SineWithId table:', err.message);
+              }
+              resolve();
+            });
+          });
         });
       });
-    });
+    };
+    
+    // Start connection attempts
+    attemptConnection();
   });
 };
 
@@ -90,67 +260,127 @@ let userTablesDb = null;
 // First, create the database if it doesn't exist, then connect to it
 const initializeUserTablesDb = () => {
   return new Promise((resolve) => {
-    // First connect without database to create it if needed
-    const tempDb = mysql.createConnection({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'root',
-      password: process.env.DB_PASSWORD || '',
-      port: process.env.DB_PORT || 3306
-    });
-    
-    tempDb.connect((err) => {
-      if (err) {
-        console.warn('⚠️  Temp database connection failed:', err.message);
-        console.warn('⚠️  Server will continue running without user tables database connection');
-        console.warn('⚠️  You can restore the database from cloud backup when ready');
-        resolve();
-        return;
-      }
+    // Function to attempt connection with retry
+    const attemptConnection = (retryCount = 0) => {
+      const maxRetries = 5;
+      const retryDelay = 3000; // 3 seconds
       
-      const createDbSql = 'CREATE DATABASE IF NOT EXISTS iwantdz_user_tables';
+      // First connect without database to create it if needed
+      const tempDb = mysql.createConnection({
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASSWORD || '',
+        port: process.env.DB_PORT || 3306
+      });
       
-      tempDb.query(createDbSql, (err) => {
+      tempDb.connect((err) => {
         if (err) {
-          console.warn('⚠️  Error creating user tables database:', err.message);
+          if (retryCount < maxRetries) {
+            console.warn(`⚠️  User tables database connection attempt ${retryCount + 1} failed, retrying in ${retryDelay/1000}s...`);
+            tempDb.end();
+            setTimeout(() => attemptConnection(retryCount + 1), retryDelay);
+            return;
+          }
+          console.warn('⚠️  Temp database connection failed:', err.message);
           console.warn('⚠️  Server will continue running without user tables database connection');
           console.warn('⚠️  You can restore the database from cloud backup when ready');
-          tempDb.end();
           resolve();
           return;
         }
         
-        console.log('User tables database checked/created');
-        tempDb.end();
+        const createDbSql = 'CREATE DATABASE IF NOT EXISTS iwantdz_user_tables';
         
-        // Now connect to the specific database
-        userTablesDb = mysql.createConnection({
-          host: process.env.DB_HOST || 'localhost',
-          user: process.env.DB_USER || 'root',
-          password: process.env.DB_PASSWORD || '',
-          database: 'iwantdz_user_tables',
-          port: process.env.DB_PORT || 3306
-        });
-        
-        userTablesDb.connect((err) => {
+        tempDb.query(createDbSql, (err) => {
           if (err) {
-            console.warn('⚠️  User tables database connection failed:', err.message);
+            console.warn('⚠️  Error creating user tables database:', err.message);
             console.warn('⚠️  Server will continue running without user tables database connection');
             console.warn('⚠️  You can restore the database from cloud backup when ready');
+            tempDb.end();
             resolve();
             return;
           }
           
-          console.log('Connected to user tables database');
-          resolve();
+          console.log('User tables database checked/created');
+          tempDb.end();
+          
+          // Now connect to the specific database
+          userTablesDb = mysql.createConnection({
+            host: process.env.DB_HOST || 'localhost',
+            user: process.env.DB_USER || 'root',
+            password: process.env.DB_PASSWORD || '',
+            database: 'iwantdz_user_tables',
+            port: process.env.DB_PORT || 3306
+          });
+          
+          userTablesDb.connect((err) => {
+            if (err) {
+              console.warn('⚠️  User tables database connection failed:', err.message);
+              console.warn('⚠️  Server will continue running without user tables database connection');
+              console.warn('⚠️  You can restore the database from cloud backup when ready');
+              resolve();
+              return;
+            }
+            
+            console.log('Connected to user tables database');
+            resolve();
+          });
         });
       });
-    });
+    };
+    
+    // Start connection attempts
+    attemptConnection();
   });
 };
 
 // Initialize databases before starting the server
 Promise.all([initializeMainDb(), initializeUserTablesDb()]).then(() => {
   console.log('Database initialization completed');
+  
+  // Import JSON data to MySQL after database initialization
+  console.log('📥 Importing JSON data to MySQL...');
+  importJsonToMySQL().then(() => {
+    console.log('✅ Import to MySQL completed');
+    
+    // Update User table schema to ensure password column exists
+    if (db) {
+      console.log('🔧 Updating User table schema...');
+      
+      // Check and add currentOid column if it doesn't exist
+      const checkCurrentOidSql = `SHOW COLUMNS FROM User LIKE 'currentOid'`;
+      db.query(checkCurrentOidSql, (err, results) => {
+        if (!err && results.length === 0) {
+          const addCurrentOidSql = `ALTER TABLE User ADD COLUMN currentOid VARCHAR(20)`;
+          db.query(addCurrentOidSql, (err) => {
+            if (err) {
+              console.log('⚠️ Failed to add currentOid column:', err.message);
+            } else {
+              console.log('✅ Added currentOid column');
+            }
+          });
+        }
+      });
+      
+      // Check and add password column if it doesn't exist
+      const checkPasswordSql = `SHOW COLUMNS FROM User LIKE 'password'`;
+      db.query(checkPasswordSql, (err, results) => {
+        if (!err && results.length === 0) {
+          const addPasswordSql = `ALTER TABLE User ADD COLUMN password VARCHAR(255)`;
+          db.query(addPasswordSql, (err) => {
+            if (err) {
+              console.log('⚠️ Failed to add password column:', err.message);
+            } else {
+              console.log('✅ Added password column');
+            }
+          });
+        } else if (!err) {
+          console.log('✅ User table schema already up to date');
+        }
+      });
+    }
+  }).catch((mysqlError) => {
+    console.log('⚠️ Import to MySQL failed:', mysqlError.message);
+  });
 }).catch(err => {
   console.error('Some databases failed to initialize:', err);
   console.warn('Server will continue running despite database initialization failures');
@@ -573,6 +803,29 @@ app.post('/api/update-user-bid', (req, res) => {
   });
 });
 
+// Helper function to ensure SineWithId table exists
+function ensureSineWithIdTableExists(callback) {
+  const createTableSql = `
+    CREATE TABLE IF NOT EXISTS SineWithId (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(255) NOT NULL,
+      Oid VARCHAR(255) NOT NULL,
+      dateTime TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      Device VARCHAR(255)
+    )
+  `;
+  
+  db.query(createTableSql, (err, results) => {
+    if (err) {
+      console.error('❌ Error creating SineWithId table:', err);
+      callback(err);
+    } else {
+      console.log('✅ SineWithId table checked/created');
+      callback(null);
+    }
+  });
+}
+
 // Helper function to ensure Notifications table exists
 function ensureNotificationsTableExists(callback) {
   const createTableSql = `
@@ -844,7 +1097,8 @@ app.post('/api/update-user-schema', (req, res) => {
   }
   const alterSql = `
     ALTER TABLE User 
-    ADD COLUMN IF NOT EXISTS currentOid VARCHAR(20)
+    ADD COLUMN IF NOT EXISTS currentOid VARCHAR(20),
+    ADD COLUMN IF NOT EXISTS password VARCHAR(255)
   `;
   
   db.query(alterSql, (err, results) => {
@@ -857,7 +1111,7 @@ app.post('/api/update-user-schema', (req, res) => {
     console.log('✅ User schema updated');
     res.json({ 
       message: 'User table schema updated successfully',
-      changes: 'Added currentOid column'
+      changes: 'Added currentOid and password columns'
     });
   });
 });
@@ -1443,13 +1697,17 @@ app.post('/api/login-by-oid', (req, res) => {
   };
   
   // Step 1: Check if Oid exists in SineWithId
+  report.steps.push({ step: 1, action: 'Checking Oid in SineWithId', status: 'in_progress' });
+  
   const checkOidSql = 'SELECT * FROM SineWithId WHERE Oid = ?';
   
   db.query(checkOidSql, [Oid], (err, sineWithIdResults) => {
     if (err) {
       console.log('❌ Login by OID failed (Oid check):', err.message);
-      report.steps[0].status = 'failed';
-      report.steps[0].error = err.message;
+      if (report.steps[0]) {
+        report.steps[0].status = 'failed';
+        report.steps[0].error = err.message;
+      }
       report.message = 'Database error during Oid check';
       res.status(500).json(report);
       return;
@@ -1457,22 +1715,36 @@ app.post('/api/login-by-oid', (req, res) => {
     
     if (sineWithIdResults.length === 0) {
       console.log('❌ Login by OID failed: Oid not found');
+      if (report.steps[0]) {
+        report.steps[0].status = 'completed';
+        report.steps[0].result = 'Oid not found in database';
+      }
       report.message = 'Oid not found';
       res.status(404).json(report);
       return;
+    }
+    
+    if (report.steps[0]) {
+      report.steps[0].status = 'completed';
+      report.steps[0].result = 'Oid found in SineWithId table';
     }
     
     const sineWithIdRecord = sineWithIdResults[0];
     const username = sineWithIdRecord.username;
     
     // Step 2: Get user details
-    const getUserSql = 'SELECT id, username, email, password, BID, date, Lastupdate, position, LastPosition FROM User WHERE username = ?';
+    report.steps.push({ step: 2, action: 'Retrieving user details', status: 'in_progress' });
+    
+    // Try to get user with password column first, fallback without password
+    const getUserSql = 'SELECT id, username, email, BID, date, Lastupdate, position, LastPosition FROM User WHERE username = ?';
     
     db.query(getUserSql, [username], (err, userResults) => {
       if (err) {
         console.log('❌ Login by OID failed (user retrieval):', err.message);
-        report.steps[1].status = 'failed';
-        report.steps[1].error = err.message;
+        if (report.steps[1]) {
+          report.steps[1].status = 'failed';
+          report.steps[1].error = err.message;
+        }
         report.message = 'Database error during user retrieval';
         res.status(500).json(report);
         return;
@@ -1480,15 +1752,26 @@ app.post('/api/login-by-oid', (req, res) => {
       
       if (userResults.length === 0) {
         console.log('❌ Login by OID failed: User not found');
+        if (report.steps[1]) {
+          report.steps[1].status = 'completed';
+          report.steps[1].result = 'User not found in database';
+        }
         report.message = 'User not found for this Oid';
         res.status(404).json(report);
         return;
+      }
+      
+      if (report.steps[1]) {
+        report.steps[1].status = 'completed';
+        report.steps[1].result = 'User details retrieved successfully';
       }
       
       const user = userResults[0];
       const actualUsername = user.username;
       
       // Step 3: Insert "Sine In" order
+      report.steps.push({ step: 3, action: 'Inserting Sine In order', status: 'in_progress' });
+      
       const tableName = `tb_${actualUsername.toLowerCase()}`;
       const orderOid = generateOrderOid();
       const insertOrderSql = `
@@ -1499,21 +1782,26 @@ app.post('/api/login-by-oid', (req, res) => {
       userTablesDb.query(insertOrderSql, ['Sine In', 'Login by Oid', orderOid, 'User logged in via Oid'], (err, orderResults) => {
         if (err) {
           console.log('❌ Login by OID failed (order insertion):', err.message);
-          report.steps[2].status = 'failed';
-          report.steps[2].error = err.message;
+          if (report.steps[2]) {
+            report.steps[2].status = 'failed';
+            report.steps[2].error = err.message;
+          }
           report.message = 'Login successful but order insertion failed';
           report.success = true;
-          const { password, ...safeUser } = user;
-          report.user = safeUser;
+          report.user = user;
           res.status(200).json(report);
           return;
         }
         
+        if (report.steps[2]) {
+          report.steps[2].status = 'completed';
+          report.steps[2].result = `Sine In order inserted with OrderOid: ${orderOid}`;
+        }
+        
         report.success = true;
         report.message = 'Login successful via Oid';
-        console.log(`✅ User logged in via OID: ${actualUsername}`);
-        const { password, ...safeUser } = user;
-        report.user = safeUser;
+        console.log(`✅ ${actualUsername} logged in`);
+        report.user = user;
         report.user.BID = user.BID; // Ensure BID is included
         report.oid = Oid; // Include Oid in response (lowercase for consistency)
         report.BID = user.BID; // Include BID in response
@@ -1661,6 +1949,29 @@ app.post('/api/import-json-to-mysql', async (req, res) => {
   console.log('📥 Request received at:', new Date().toISOString());
   console.log('📥 Request body:', JSON.stringify(req.body, null, 2));
   console.log('📥 Request headers:', JSON.stringify(req.headers, null, 2));
+  
+  // First check if MySQL server is accessible
+  try {
+    console.log('📥 Checking MySQL server accessibility...');
+    const mysql = require('mysql2/promise');
+    const testConnection = await mysql.createConnection({
+      host: process.env.DB_HOST || 'localhost',
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || '',
+      port: process.env.DB_PORT || 3306
+    });
+    await testConnection.end();
+    console.log('✅ MySQL server is accessible');
+  } catch (error) {
+    console.error('❌ MySQL server is not accessible:', error);
+    console.error('❌ Error stack:', error.stack);
+    res.status(503).json({
+      success: false,
+      message: 'MySQL server is not accessible. Please ensure MySQL is running.',
+      error: error.message
+    });
+    return;
+  }
   
   try {
     console.log('📥 Starting importJsonToMySQL function...');
@@ -2194,28 +2505,30 @@ app.post('/api/refresh-active-users', (req, res) => {
     // Then broadcast active users update
     broadcastActiveUsersUpdate();
     
-    res.json({ 
+    res.json({
       message: 'Active users refresh triggered',
       cleanedUsers: cleanupResults?.affectedRows || 0
     });
   });
 });
 
-// Start Server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Server accessible at http://0.0.0.0:${PORT}`);
-});
+  // Start Server
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Server accessible at http://0.0.0.0:${PORT}`);
+  });
 
-// Helper function to generate random OrderOid (XXXX-XXXX-XXXX-XXXX format)
-function generateOrderOid() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < 16; i++) {
-    if (i > 0 && i % 4 === 0) {
-      result += '-';
+  // Helper function to generate random OrderOid (XXXX-XXXX-XXXX-XXXX format)
+  function generateOrderOid() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let result = '';
+    for (let i = 0; i < 16; i++) {
+      if (i > 0 && i % 4 === 0) {
+        result += '-';
+      }
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+    return result;
   }
-  return result;
-}
+
+})();
